@@ -1,0 +1,17 @@
+listen:
+  host: 0.0.0.0
+  port: 18080
+
+auth:
+  enabled: true
+  header_name: X-INTERNAL-KEY
+  tokens:
+    - demo-token
+
+upstreams:
+  - path_prefix: /v1
+    upstream_base: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    api_key_header: Authorization
+    api_key_prefix: Bearer
+    timeout_seconds: 60
