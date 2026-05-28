@@ -14,8 +14,8 @@
    - [x] 基于 `httpx` 的 SSE 流转发
 4. 启动与部署：
    - [x] CLI 启动入口
-   - [ ] Docker + docker-compose 示例
+   - [x] Docker + docker-compose 示例
 5. 验证：
    - [x] 配置解析测试
    - [x] 内网鉴权 + 前缀路由测试
-   - [ ] 至少一条手工转发验证清单
+   - [x] 至少一条手工转发验证清单

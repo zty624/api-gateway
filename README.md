@@ -60,6 +60,27 @@ curl -X POST http://127.0.0.1:18080/v1/chat/completions \
   -d '{"model":"gpt-4.1-mini","messages":[{"role":"user","content":"你好"}]}'
 ```
 
+### Docker 启动（推荐）
+
+1. 复制配置与环境文件：
+
+```bash
+cp config.example.yaml config.yaml
+cp .env.example .env
+```
+
+2. 启动：
+
+```bash
+docker compose up -d --build
+```
+
+3. 验证：
+
+```bash
+curl -X GET http://127.0.0.1:18080/healthz
+```
+
 ## 配置项说明
 
 - `listen`: 网关监听地址与端口。
@@ -82,3 +103,6 @@ uv run pytest
 - `src/api_gateway/`：网关核心代码。
 - `config.example.yaml`：配置样例。
 - `tests/`：最小化测试用例。
+- `Dockerfile`：容器化构建文件。
+- `docker-compose.yml`：容器编排文件。
+- `.env.example`：部署环境变量样例。

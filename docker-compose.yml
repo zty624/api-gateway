@@ -1,0 +1,14 @@
+services:
+  api-gateway:
+    build: .
+    container_name: api-gateway
+    ports:
+      - "18080:18080"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./logs:/app/logs
+    env_file:
+      - .env
+    environment:
+      - GATEWAY_CONFIG=/app/config.yaml
+    restart: unless-stopped
