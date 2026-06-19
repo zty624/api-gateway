@@ -11,7 +11,7 @@ from .config import load_config
 
 
 def build_app() -> None:
-    parser = argparse.ArgumentParser(description="LLM API Gateway")
+    parser = argparse.ArgumentParser(description="rtunnel tmux gateway")
     parser.add_argument(
         "--config",
         default=os.environ.get("GATEWAY_CONFIG", "config.yaml"),

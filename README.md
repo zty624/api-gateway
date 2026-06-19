@@ -1,97 +1,104 @@
 # api-gateway
 
-一个轻量级的 LLM API 跳板网关，面向内网服务提供统一出口。  
-网关接收来自内网服务的请求，按配置转发到外部 LLM 或内部模型服务，默认支持 OpenAI 风格接口路径。
+一个面向集群容器的单端口远程 CLI 网关。容器内部运行 `sshd`、`rtunnel`
+server、FastAPI 控制面和 nginx；外部只需要访问一个公开 URL：
 
-## 特性
+- `/api/*`：登录、状态查询、tmux session 控制面。
+- `/tunnel/`：给 `rtunnel` 客户端使用的 WebSocket TCP 隧道。
 
-- 配置驱动：所有路由与上游地址通过 YAML 文件定义。
-- 内网鉴权：通过请求头 token 白名单控制访问。
-- 路由分流：按路径前缀匹配选择不同上游。
-- 流式透传：兼容 `stream=true` 的 SSE 转发。
-- 轻量部署：纯 Python + FastAPI，`uv` 即可运行。
+终端交互不由 HTTP 模拟。用户端通过 `rtunnel` 建本地 TCP 隧道，再用普通
+`ssh` 进入容器并 attach 到 tmux，所以颜色、进度条、交互输入和 tmux 反馈都走
+SSH/PTTY 原生流。
 
 ## 快速开始
 
-1. 安装依赖（推荐 `uv`）：
-
-```bash
-uv sync
-```
-
-2. 复制配置示例并填入真实密钥环境变量：
-
-```bash
-cp config.example.yaml config.yaml
-```
-
-编辑 `config.yaml`：
-
-```yaml
-listen:
-  host: 0.0.0.0
-  port: 18080
-auth:
-  enabled: true
-  header_name: X-INTERNAL-KEY
-  tokens:
-    - demo-token
-upstreams:
-  - path_prefix: /v1
-    upstream_base: https://api.openai.com/v1
-    api_key_env: OPENAI_API_KEY
-    api_key_header: Authorization
-    api_key_prefix: Bearer
-    timeout_seconds: 60
-```
-
-3. 运行服务：
-
-```bash
-GATEWAY_CONFIG=config.yaml uv run python -m api_gateway
-```
-
-4. 访问示例（按你内网服务的 token 调用）：
-
-```bash
-curl -X POST http://127.0.0.1:18080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "X-INTERNAL-KEY: demo-token" \
-  -d '{"model":"gpt-4.1-mini","messages":[{"role":"user","content":"你好"}]}'
-```
-
-### Docker 启动（推荐）
-
-1. 复制配置与环境文件：
+1. 复制配置：
 
 ```bash
 cp config.example.yaml config.yaml
 cp .env.example .env
 ```
 
-2. 启动：
+2. 编辑 `config.yaml`：
+
+- `public_base_url` 改成集群给这个容器端口映射出来的 URL，例如
+  `https://.../proxy/8080`。
+- `auth.users` 改成实际用户和密码哈希。
+- `tmux.default_cwd` 改成容器内默认工作目录。
+
+生成密码哈希：
+
+```bash
+uv run python -c "from api_gateway.auth import hash_password; print(hash_password('your-password'))"
+```
+
+3. 准备 SSH 公钥：
+
+```bash
+cp ~/.ssh/id_ed25519.pub authorized_keys
+```
+
+4. 启动：
 
 ```bash
 docker compose up -d --build
 ```
 
-3. 验证：
+5. 登录拿 token：
 
 ```bash
-curl -X GET http://127.0.0.1:18080/healthz
+curl -sS -X POST http://127.0.0.1:8080/api/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"demo-password"}'
 ```
 
-## 配置项说明
+6. 创建 tmux session 并获取连接命令：
 
-- `listen`: 网关监听地址与端口。
-- `auth`: 鉴权开关、头名和 token 白名单（用于内网接入控制）。
-- `upstreams`: 路由列表。
-  - `path_prefix`: 请求路径前缀匹配（按长度从长到短匹配）。
-  - `upstream_base`: 实际转发的上游基础 URL。网关会先移除 `path_prefix` 再拼接后续路径，所以这里可以是完整 `https://api.openai.com/v1` 或仅 `https://api.openai.com`。
-  - `api_key_env`: 从环境变量读取上游密钥。
-  - `api_key_header` / `api_key_prefix`: 组装上游鉴权头。
+```bash
+TOKEN="<access_token>"
 
-## 开发与验证
+curl -sS -X POST http://127.0.0.1:8080/api/sessions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"work","cwd":"/workspace"}'
+
+curl -sS http://127.0.0.1:8080/api/sessions/work/connect \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+返回值会包含两条命令：
+
+```bash
+rtunnel https://example.com/proxy/8080/tunnel/ 127.0.0.1:2226 \
+  -H 'Authorization: Bearer <token>'
+
+ssh -p 2226 root@localhost -t 'tmux new-session -A -s gateway-work'
+```
+
+先启动 `rtunnel`，再执行 `ssh`，就能看到远端 tmux 的实时反馈。
+
+## API
+
+- `POST /api/login`
+- `POST /api/logout`
+- `GET /api/healthz`
+- `GET /api/status`
+- `GET /api/sessions`
+- `POST /api/sessions`
+- `GET /api/sessions/{name}`
+- `DELETE /api/sessions/{name}`
+- `GET /api/sessions/{name}/connect`
+
+除 `/api/login` 和 `/api/healthz` 外，API 都需要：
+
+```text
+Authorization: Bearer <token>
+```
+
+`/tunnel/` 同样需要这个 header，nginx 会先调用 FastAPI 的内部鉴权端点再把
+WebSocket 连接转发给内部 rtunnel server。
+
+## 开发验证
 
 ```bash
 uv run ruff check src tests
@@ -100,9 +107,8 @@ uv run pytest
 
 ## 文件说明
 
-- `src/api_gateway/`：网关核心代码。
-- `config.example.yaml`：配置样例。
-- `tests/`：最小化测试用例。
-- `Dockerfile`：容器化构建文件。
-- `docker-compose.yml`：容器编排文件。
-- `.env.example`：部署环境变量样例。
+- `src/api_gateway/app.py`：FastAPI 控制面。
+- `src/api_gateway/auth.py`：PBKDF2 密码校验和内存 token。
+- `src/api_gateway/tmux.py`：tmux session 管理。
+- `deploy/nginx.conf.template`：单端口 `/api/` 与 `/tunnel/` 分流。
+- `scripts/entrypoint.sh`：容器内启动 sshd、rtunnel、API 和 nginx。

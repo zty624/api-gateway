@@ -1,1 +1,1 @@
-"""LLM API 跳板网关."""
+"""Authenticated rtunnel, sshd, and tmux gateway."""

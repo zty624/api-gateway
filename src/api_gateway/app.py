@@ -1,260 +1,238 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+import shutil
+import shlex
+from pathlib import Path
 
-import json
-import logging
-import os
-from uuid import uuid4
+from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
+from pydantic import BaseModel
 
-import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import Response, StreamingResponse
-from starlette.background import BackgroundTask
-
-from .config import GatewayConfig, UpstreamConfig
-
-logger = logging.getLogger("api_gateway")
-
-UPSTREAM_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]
-HOP_BY_HOP_HEADERS = {
-    "connection",
-    "connection-token",
-    "upgrade",
-    "keep-alive",
-    "proxy-connection",
-    "transfer-encoding",
-    "te",
-    "trailers",
-    "host",
-}
-DROP_RESPONSE_HEADERS = {
-    "content-encoding",
-    "content-length",
-    "transfer-encoding",
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-}
+from .auth import AuthManager, TokenResponse
+from .config import GatewayConfig
+from .tmux import TmuxError, TmuxManager, TmuxNameError, TmuxSession, validate_session_name
 
 
-def _should_stream_request(body: bytes, content_type: str) -> bool:
-    if "application/json" not in content_type.lower():
-        return False
-    if not body:
-        return False
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class SessionCreateRequest(BaseModel):
+    name: str
+    cwd: Path | None = None
+
+
+class ConnectResponse(BaseModel):
+    name: str
+    tmux_name: str
+    tunnel_url: str
+    rtunnel_command: str
+    ssh_command: str
+
+
+class AuthContext(BaseModel):
+    username: str
+    token: str
+
+
+def _bearer_token(authorization: str | None) -> str:
+    if not authorization:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing token")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
+    return token
+
+
+def _tunnel_url(cfg: GatewayConfig) -> str:
+    return f"{cfg.public_base_url}{cfg.rtunnel.public_path}"
+
+
+def _client_port(addr: str) -> int:
+    _, _, port = addr.rpartition(":")
     try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        return False
-    return bool(payload.get("stream"))
+        return int(port)
+    except ValueError as exc:
+        raise ValueError(f"invalid client_local_addr: {addr}") from exc
 
 
-def _normalize_path(path: str) -> str:
-    return f"/{path}" if not path.startswith("/") else path
+def _connect_response(cfg: GatewayConfig, token: str, name: str) -> ConnectResponse:
+    tmux_name = f"{cfg.tmux.session_prefix}{name}"
+    tunnel_url = _tunnel_url(cfg)
+    auth_header = f"Authorization: Bearer {token}"
+    rtunnel_command = " ".join(
+        [
+            shlex.quote(cfg.rtunnel.binary),
+            shlex.quote(tunnel_url),
+            shlex.quote(cfg.rtunnel.client_local_addr),
+            "-H",
+            shlex.quote(auth_header),
+        ]
+    )
+    ssh_command = " ".join(
+        [
+            "ssh",
+            "-p",
+            str(_client_port(cfg.rtunnel.client_local_addr)),
+            f"{cfg.ssh.user}@localhost",
+            "-t",
+            shlex.quote(f"tmux new-session -A -s {tmux_name}"),
+        ]
+    )
+    return ConnectResponse(
+        name=name,
+        tmux_name=tmux_name,
+        tunnel_url=tunnel_url,
+        rtunnel_command=rtunnel_command,
+        ssh_command=ssh_command,
+    )
 
 
-def _find_upstream(path: str, upstreams: list[UpstreamConfig]) -> UpstreamConfig | None:
-    for upstream in upstreams:
-        if upstream.path_prefix == "/":
-            return upstream
-        if path == upstream.path_prefix or path.startswith(f"{upstream.path_prefix}/"):
-            return upstream
-    return None
-
-
-def _build_request_headers(request: Request, upstream: UpstreamConfig) -> dict[str, str]:
-    headers = {
-        name: value
-        for name, value in request.headers.items()
-        if name.lower() not in HOP_BY_HOP_HEADERS
-    }
-
-    if upstream.extra_headers:
-        headers.update(upstream.extra_headers)
-
-    if upstream.api_key_env:
-        api_key = os.getenv(upstream.api_key_env)
-        if not api_key:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"缺失上游鉴权环境变量: {upstream.api_key_env}",
-            )
-        value = api_key
-        if upstream.api_key_header.lower() == "authorization":
-            value = f"{upstream.api_key_prefix} {api_key}".strip()
-        headers[upstream.api_key_header] = value
-    return headers
-
-
-def _filter_response_headers(headers: httpx.Headers) -> dict[str, str]:
+async def _status_payload(cfg: GatewayConfig, auth: AuthManager, tmux: TmuxManager) -> dict:
+    tmux_available = shutil.which(cfg.tmux.binary) is not None
+    session_count = 0
+    tmux_error = None
+    if tmux_available:
+        try:
+            session_count = len(await tmux.list())
+        except TmuxError as exc:
+            tmux_error = str(exc)
     return {
-        name: value
-        for name, value in headers.items()
-        if name.lower() not in DROP_RESPONSE_HEADERS
+        "status": "ok",
+        "auth": {"active_tokens": auth.active_count()},
+        "sshd": {
+            "host": cfg.ssh.host,
+            "port": cfg.ssh.port,
+            "binary_available": shutil.which("sshd") is not None
+            or shutil.which("/usr/sbin/sshd") is not None,
+        },
+        "rtunnel": {
+            "target": cfg.rtunnel.target,
+            "listen": cfg.rtunnel.listen,
+            "binary_available": shutil.which(cfg.rtunnel.binary) is not None,
+        },
+        "nginx": {"binary_available": shutil.which("nginx") is not None},
+        "tmux": {
+            "binary_available": tmux_available,
+            "session_count": session_count,
+            "error": tmux_error,
+        },
     }
 
 
-async def _forward_regular(
-    request: Request,
-    target_url: str,
-    headers: dict[str, str],
-    body: bytes,
-    timeout: float,
-) -> Response:
-    timeout_conf = httpx.Timeout(timeout)
-    async with httpx.AsyncClient(timeout=timeout_conf) as client:
-        upstream = await client.request(
-            request.method,
-            target_url,
-            headers=headers,
-            params=request.query_params,
-            content=body,
-        )
-        response_body = await upstream.aread()
+def create_app(
+    config: GatewayConfig,
+    *,
+    auth: AuthManager | None = None,
+    tmux: TmuxManager | None = None,
+) -> FastAPI:
+    app = FastAPI(title="rtunnel tmux gateway", version="0.1.0")
+    auth_manager = auth or AuthManager(config.auth)
+    tmux_manager = tmux or TmuxManager(config.tmux)
 
-    response_headers = _filter_response_headers(upstream.headers)
-    media_type = response_headers.get("content-type")
-    return Response(
-        status_code=upstream.status_code,
-        content=response_body,
-        media_type=media_type,
-        headers=response_headers,
-    )
+    def require_auth(authorization: str | None = Header(default=None)) -> AuthContext:
+        if not config.auth.enabled:
+            return AuthContext(username="auth-disabled", token="")
+        token = _bearer_token(authorization)
+        try:
+            username = auth_manager.validate(token)
+        except PermissionError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=str(exc),
+            ) from exc
+        return AuthContext(username=username, token=token)
 
+    @app.post("/api/login", response_model=TokenResponse)
+    async def login(payload: LoginRequest) -> TokenResponse:
+        try:
+            return auth_manager.login(payload.username, payload.password)
+        except PermissionError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="invalid username or password",
+            ) from exc
 
-async def _forward_stream(
-    request: Request,
-    target_url: str,
-    headers: dict[str, str],
-    body: bytes,
-    timeout: float,
-) -> StreamingResponse:
-    timeout_conf = httpx.Timeout(timeout)
-    client = httpx.AsyncClient(timeout=timeout_conf)
-
-    req = client.build_request(
-        request.method,
-        target_url,
-        headers=headers,
-        params=request.query_params,
-        content=body,
-    )
-    upstream = await client.send(req, stream=True)
-
-    if upstream.status_code >= 400:
-        response_body = await upstream.aread()
-        response_headers = _filter_response_headers(upstream.headers)
-        await upstream.aclose()
-        await client.aclose()
-        return Response(
-            status_code=upstream.status_code,
-            content=response_body,
-            media_type=response_headers.get("content-type"),
-            headers=response_headers,
-        )
-
-    response_headers = _filter_response_headers(upstream.headers)
-    response_media_type = response_headers.pop("content-type", "text/event-stream")
-    response_status = upstream.status_code
-
-    async def stream() -> AsyncGenerator[bytes, None]:
-        async for chunk in upstream.aiter_bytes():
-            if chunk:
-                yield chunk
-
-    async def close_resources() -> None:
-        await upstream.aclose()
-        await client.aclose()
-
-    return StreamingResponse(
-        stream(),
-        status_code=response_status,
-        headers=response_headers,
-        media_type=response_media_type,
-        background=BackgroundTask(close_resources),
-    )
-
-
-def _require_auth(request: Request, cfg: GatewayConfig) -> None:
-    if not cfg.auth.enabled:
-        return
-    if not cfg.auth.tokens:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="未配置任何内网访问 token",
-        )
-    token = request.headers.get(cfg.auth.header_name)
-    if token not in set(cfg.auth.tokens):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="未通过网关鉴权",
-        )
-
-
-def create_app(config: GatewayConfig) -> FastAPI:
-    app = FastAPI(title="LLM API Gateway", version="0.1.0")
-
-    def get_config() -> GatewayConfig:
-        return config
-
-    @app.get("/healthz")
-    async def healthz() -> dict[str, str]:
+    @app.post("/api/logout")
+    async def logout(ctx: AuthContext = Depends(require_auth)) -> dict[str, str]:
+        if ctx.token:
+            auth_manager.logout(ctx.token)
         return {"status": "ok"}
 
-    @app.api_route(
-        "/{path:path}",
-        methods=UPSTREAM_METHODS,
-        include_in_schema=False,
-    )
-    async def proxy_request(
-        path: str, request: Request, cfg: GatewayConfig = Depends(get_config)
-    ):
-        if path == "healthz":
-            return {"status": "ok"}
+    @app.get("/api/internal/auth", status_code=status.HTTP_204_NO_CONTENT)
+    async def internal_auth(_: AuthContext = Depends(require_auth)) -> Response:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-        _require_auth(request, cfg)
+    @app.get("/api/healthz")
+    async def api_healthz() -> dict[str, str]:
+        return {"status": "ok"}
 
-        full_path = _normalize_path(path)
-        upstream = _find_upstream(full_path, cfg.upstreams)
-        if not upstream:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="未配置匹配路由",
-            )
+    @app.get("/healthz")
+    async def root_healthz() -> dict[str, str]:
+        return {"status": "ok"}
 
-        request_id = request.headers.get("x-request-id", str(uuid4()))
-        body = await request.body()
+    @app.get("/api/status")
+    async def status_route(_: AuthContext = Depends(require_auth)) -> dict:
+        return await _status_payload(config, auth_manager, tmux_manager)
 
-        upstream_headers = _build_request_headers(request, upstream)
-        suffix = full_path[len(upstream.path_prefix) :]
-        if not suffix:
-            suffix = "/"
-        target_url = str(upstream.upstream_base).rstrip("/") + suffix
-        content_type = request.headers.get("content-type", "")
-        logger.info(
-            "[%s] %s %s -> %s",
-            request_id,
-            request.method,
-            full_path,
-            target_url,
-        )
+    @app.get("/api/sessions", response_model=list[TmuxSession])
+    async def list_sessions(_: AuthContext = Depends(require_auth)) -> list[TmuxSession]:
+        try:
+            return await tmux_manager.list()
+        except TmuxError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-        if _should_stream_request(body, content_type):
-            return await _forward_stream(
-                request,
-                target_url,
-                upstream_headers,
-                body,
-                upstream.timeout_seconds,
-            )
+    @app.post("/api/sessions", response_model=TmuxSession)
+    async def create_session(
+        payload: SessionCreateRequest,
+        _: AuthContext = Depends(require_auth),
+    ) -> TmuxSession:
+        if payload.cwd is not None and not payload.cwd.is_absolute():
+            raise HTTPException(status_code=400, detail="cwd must be an absolute path")
+        try:
+            current = await tmux_manager.get(payload.name)
+            if current.exists:
+                return current
+            return await tmux_manager.create(payload.name, payload.cwd)
+        except TmuxNameError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TmuxError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        return await _forward_regular(
-            request,
-            target_url,
-            upstream_headers,
-            body,
-            upstream.timeout_seconds,
-        )
+    @app.get("/api/sessions/{name}", response_model=TmuxSession)
+    async def get_session(name: str, _: AuthContext = Depends(require_auth)) -> TmuxSession:
+        try:
+            session = await tmux_manager.get(name)
+        except TmuxNameError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TmuxError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if not session.exists:
+            raise HTTPException(status_code=404, detail="session not found")
+        return session
+
+    @app.delete("/api/sessions/{name}")
+    async def delete_session(name: str, _: AuthContext = Depends(require_auth)) -> dict[str, str]:
+        try:
+            session = await tmux_manager.get(name)
+            if not session.exists:
+                raise HTTPException(status_code=404, detail="session not found")
+            await tmux_manager.delete(name)
+        except TmuxNameError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TmuxError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {"status": "ok"}
+
+    @app.get("/api/sessions/{name}/connect", response_model=ConnectResponse)
+    async def connect_session(
+        name: str,
+        ctx: AuthContext = Depends(require_auth),
+    ) -> ConnectResponse:
+        try:
+            validate_session_name(name)
+            return _connect_response(config, ctx.token, name)
+        except (TmuxNameError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return app
