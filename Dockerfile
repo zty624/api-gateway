@@ -13,8 +13,9 @@ RUN apt-get update \
         tmux \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -L "$RTUNNEL_URL" -o /usr/local/bin/rtunnel \
-    && chmod +x /usr/local/bin/rtunnel
+RUN mkdir -p /app/bin \
+    && curl -L "$RTUNNEL_URL" -o /app/bin/rtunnel \
+    && chmod +x /app/bin/rtunnel
 
 COPY pyproject.toml README.md config.example.yaml ./
 COPY deploy ./deploy
@@ -28,6 +29,6 @@ EXPOSE 8080
 
 ENV GATEWAY_CONFIG=/app/config.yaml
 ENV PUBLIC_PORT=8080
-ENV RTUNNEL_BINARY=/usr/local/bin/rtunnel
+ENV RTUNNEL_BINARY=/app/bin/rtunnel
 
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]

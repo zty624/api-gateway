@@ -2,9 +2,11 @@
 set -euo pipefail
 
 PUBLIC_PORT="${PUBLIC_PORT:-8080}"
-GATEWAY_CONFIG="${GATEWAY_CONFIG:-/app/config.yaml}"
-RTUNNEL_BINARY="${RTUNNEL_BINARY:-/usr/local/bin/rtunnel}"
-NGINX_TEMPLATE="${NGINX_TEMPLATE:-/app/deploy/nginx.conf.template}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+GATEWAY_CONFIG="${GATEWAY_CONFIG:-$ROOT_DIR/config.yaml}"
+RTUNNEL_BINARY="${RTUNNEL_BINARY:-$ROOT_DIR/bin/rtunnel}"
+NGINX_TEMPLATE="${NGINX_TEMPLATE:-$ROOT_DIR/deploy/nginx.conf.template}"
 NGINX_CONFIG="${NGINX_CONFIG:-/tmp/api-gateway-nginx.conf}"
 AUTHORIZED_KEYS_PATH="${AUTHORIZED_KEYS_PATH:-/root/.ssh/authorized_keys}"
 
@@ -32,6 +34,10 @@ prepare_authorized_keys() {
 
   chmod 700 "$(dirname "$AUTHORIZED_KEYS_PATH")"
   chmod 600 "$AUTHORIZED_KEYS_PATH"
+}
+
+prepare_rtunnel() {
+  "$ROOT_DIR/scripts/install_rtunnel.sh" "$RTUNNEL_BINARY"
 }
 
 start_sshd() {
@@ -62,6 +68,7 @@ start_nginx() {
 }
 
 prepare_authorized_keys
+prepare_rtunnel
 start_sshd
 start_rtunnel
 start_api

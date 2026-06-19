@@ -44,6 +44,21 @@ cp ~/.ssh/id_ed25519.pub authorized_keys
 docker compose up -d --build
 ```
 
+非 Docker 服务器可以显式指定 rtunnel 启动路径：
+
+```bash
+uv sync
+scripts/install_rtunnel.sh ./bin/rtunnel
+RTUNNEL_BINARY="$PWD/bin/rtunnel" \
+GATEWAY_CONFIG="$PWD/config.yaml" \
+NGINX_TEMPLATE="$PWD/deploy/nginx.conf.template" \
+PUBLIC_PORT=8080 \
+scripts/entrypoint.sh
+```
+
+如果不设置 `RTUNNEL_BINARY`，`scripts/entrypoint.sh` 默认使用并自动下载到
+`$PWD/bin/rtunnel`。
+
 5. 登录拿 token：
 
 ```bash
